@@ -128,15 +128,22 @@ object RichPipeEx extends FieldConversions with TupleConversions with java.io.Se
     new TypedRichPipeEx(pipe)
 }
 
-class TypedRichPipeEx[K: Ordering, V: Monoid](pipe: TypedPipe[(K,V)]) extends java.io.Serializable {
+class TypedRichPipeEx[K: Ordering, V: Monoid]
+(pipe: TypedPipe[(K,V)], monoidIsCommutative: Boolean = false) extends java.io.Serializable {
+
   import Dsl._
   import TDsl._
 
-  // Tap reads existing data from the `sourceVersion` (or latest
-  // version) of data specified in `src`, merges the K,V pairs from
-  // the pipe in using an implicit `Monoid[V]` and sinks all results
-  // into the `sinkVersion` of data (or a new version) specified by
-  // `src`.
+  /**
+   * Tap reads existing data from the `sourceVersion` (or latest
+   * version) of data specified in `src`, merges the K,V pairs from
+   * the pipe in using an implicit `Monoid[V]` and sinks all results
+   * into the `sinkVersion` of data (or a new version) specified by
+   * `src`.
+   *
+   * iff not `monoidIsCommutative`, then sort the values before reducing with the Monoid so that
+   * older values are on the left.
+   */
   def writeIncremental(src: VersionedKeyValSource[K,V], reducers: Int = 1)
   (implicit flowDef: FlowDef, mode: Mode) = {
     val outPipe =
@@ -149,10 +156,17 @@ class TypedRichPipeEx[K: Ordering, V: Monoid](pipe: TypedPipe[(K,V)]) extends ja
 
         val newPairs = pipe.map { _ :+ 1 }
 
-        (oldPairs ++ newPairs)
+        val grouped = (oldPairs ++ newPairs)
           .groupBy {  _._1 }
           .withReducers(reducers)
-          .sortBy { _._3 }
+
+        val maybeSorted =
+          if (monoidIsCommutative)
+            grouped
+          else
+            grouped.sortBy { _._3 }
+
+        maybeSorted
           .mapValues { _._2 }
           .sum
       }
@@ -161,7 +175,7 @@ class TypedRichPipeEx[K: Ordering, V: Monoid](pipe: TypedPipe[(K,V)]) extends ja
   }
 }
 
-class RichPipeEx(pipe: Pipe) extends java.io.Serializable {
+class RichPipeEx(pipe: Pipe, monoidIsCommutative: Boolean = false) extends java.io.Serializable {
   import Dsl._
 
   // VersionedKeyValSource always merges with the most recent complete
@@ -181,7 +195,15 @@ class RichPipeEx(pipe: Pipe) extends java.io.Serializable {
         val newPairs = appendToken(pipe, 1)
 
         (oldPairs ++ newPairs)
-          .groupBy('key) { _.reducers(reducers).sortBy('isNew).plus[V]('value) }
+          .groupBy('key) { builder : GroupBuilder =>
+            val setReducers = builder.reducers(reducers)
+            val maybeSorted =
+              if (monoidIsCommutative)
+                setReducers
+              else
+                setReducers.sortBy('isNew)
+            maybeSorted.plus[V]('value)
+          }
           .project(('key,'value))
           .rename(('key, 'value) -> fields)
       }
